@@ -1,0 +1,225 @@
+name: Daily EPG Update
+
+on:
+  schedule:
+    # 每天00:40 10:15 15:00 18:30更新  UTC 16:40 = 北京时间 00:40
+    - cron: 40 16 * * *
+    - cron: 15 02 * * *
+    - cron: 00 07 * * *
+    - cron: 30 10 * * *
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-epg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run EPG update (all platforms)
+        env:
+          EPG_ENABLE_CN: "true"
+          EPG_ENABLE_TVB: "true"
+          EPG_ENABLE_NOWTV: "true"
+          EPG_ENABLE_HAMI: "true"
+          EPG_ENABLE_ASTRO: "true"
+          EPG_ENABLE_RTHK: "true"
+          EPG_ENABLE_HOY: "true"
+          EPG_ENABLE_STARHUB: "true"
+          EPG_ENABLE_MEWATCH: "true"
+          EPG_ENABLE_SINGTEL: "true"
+          EPG_ENABLE_UNIFITV: "true"
+          EPG_ENABLE_FENGSHOWS: "true"
+          EPG_ENABLE_4GTV: "true"
+          EPG_ENABLE_CATCHPLAY: "true"
+          EPG_ENABLE_SKYGONZ: "true"
+          EPG_ENABLE_TELUS: "true"
+          EPG_ENABLE_BEIN: "true"
+          EPG_ENABLE_SLING: "true"
+          EPG_ENABLE_SLING_SPORTS: "true"
+          TZ: Asia/Shanghai
+          EPG_TIMEZONE: Asia/Shanghai
+          LOG_LEVEL: INFO
+          EPG_BASE_DIR: epg_files
+          # 如有代理可取消注释：
+          # SINGTEL_PROXY: socks5://user:pass@host:1080
+          # CATCHPLAY_PROXY: socks5://user:pass@host:1080
+        run: |
+          python - << 'EOF'
+          import asyncio
+          import sys
+          import os
+
+          sys.path.insert(0, os.getcwd())
+          from app.main import update_all_enabled_platforms
+
+          async def main():
+              print("🚀 开始更新所有启用平台的 EPG...")
+              await update_all_enabled_platforms()
+              print("✅ 更新流程结束")
+
+          asyncio.run(main())
+          EOF
+
+      - name: Prepare public files
+        run: |
+          mkdir -p public
+          DATE=$(date +%Y%m%d)
+
+          if [ -f "epg_files/all/all_${DATE}.xml" ]; then
+            cp "epg_files/all/all_${DATE}.xml" public/all.xml
+            echo "✅ 已生成 public/all.xml"
+          else
+            echo "⚠️ 未找到 all_${DATE}.xml，尝试找最新的 all_*.xml"
+            LATEST=$(ls -1 epg_files/all/all_*.xml 2>/dev/null | sort | tail -1 || true)
+            if [ -n "$LATEST" ]; then
+              cp "$LATEST" public/all.xml
+              echo "✅ 使用 $LATEST -> public/all.xml"
+            else
+              echo "❌ 没有任何 all XML 文件"
+              exit 1
+            fi
+          fi
+
+          if [ -f "epg_files/all/all_${DATE}.xml.gz" ]; then
+            cp "epg_files/all/all_${DATE}.xml.gz" public/all.xml.gz
+            echo "✅ 已生成 public/all.xml.gz"
+          else
+            LATEST_GZ=$(ls -1 epg_files/all/all_*.xml.gz 2>/dev/null | sort | tail -1 || true)
+            if [ -n "$LATEST_GZ" ]; then
+              cp "$LATEST_GZ" public/all.xml.gz
+              echo "✅ 使用 $LATEST_GZ -> public/all.xml.gz"
+            fi
+          fi
+
+          mkdir -p public/platforms
+          for dir in epg_files/*/; do
+            plat=$(basename "$dir")
+            [ "$plat" = "all" ] && continue
+            LATEST=$(ls -1 "$dir"/${plat}_*.xml 2>/dev/null | sort | tail -1 || true)
+            if [ -n "$LATEST" ]; then
+              cp "$LATEST" "public/platforms/${plat}.xml"
+            fi
+          done
+
+          ls -lh public/ || true
+          ls -lh public/platforms/ || true
+
+      - name: Compat channel ids (凤凰*台 双向兼容)
+        run: |
+          python - << 'EOF'
+          import gzip
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          def process(xml_path: Path):
+              if not xml_path.exists():
+                  print(f"skip: {xml_path}")
+                  return
+
+              tree = ET.parse(xml_path)
+              root = tree.getroot()
+
+              existing = set()
+              for ch in root.findall("channel"):
+                  cid = ch.get("id")
+                  if cid:
+                      existing.add(cid)
+
+              to_add_channels = []
+              id_map = {}  # old_id -> [alias_ids]
+              keywords = ("凤凰", "鳳凰", "Phoenix")
+
+              for ch in list(root.findall("channel")):
+                  cid = ch.get("id") or ""
+                  if not cid:
+                      continue
+                  if not any(k in cid for k in keywords):
+                      continue
+
+                  aliases = []
+                  if cid.endswith("台"):
+                      base = cid[:-1]
+                      if base and base not in existing:
+                          aliases.append(base)
+                  else:
+                      with_tai = cid + "台"
+                      if with_tai not in existing:
+                          aliases.append(with_tai)
+
+                  for aid in aliases:
+                      if aid in existing:
+                          continue
+                      new_ch = ET.Element("channel", {"id": aid})
+                      for child in ch:
+                          new_ch.append(child)
+                      if new_ch.find("display-name") is None:
+                          dn = ET.SubElement(new_ch, "display-name")
+                          dn.text = aid
+                      to_add_channels.append(new_ch)
+                      existing.add(aid)
+                      id_map.setdefault(cid, []).append(aid)
+
+              for new_ch in to_add_channels:
+                  root.append(new_ch)
+
+              new_programmes = []
+              for prog in list(root.findall("programme")):
+                  ch_id = prog.get("channel") or ""
+                  if ch_id not in id_map:
+                      continue
+                  for aid in id_map[ch_id]:
+                      new_p = ET.Element("programme", dict(prog.attrib))
+                      new_p.set("channel", aid)
+                      for child in prog:
+                          new_p.append(child)
+                      new_programmes.append(new_p)
+
+              for p in new_programmes:
+                  root.append(p)
+
+              tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+              print(f"OK {xml_path.name}: +{len(to_add_channels)} channels, +{len(new_programmes)} programmes")
+
+          public = Path("public")
+          process(public / "all.xml")
+
+          xml_file = public / "all.xml"
+          gz_file = public / "all.xml.gz"
+          if xml_file.exists():
+              data = xml_file.read_bytes()
+              with gzip.open(gz_file, "wb", compresslevel=9) as f:
+                  f.write(data)
+              print(f"OK rewritten {gz_file}")
+          EOF
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add public/ || true
+
+          if git diff --staged --quiet; then
+            echo "没有文件变化，跳过提交"
+            exit 0
+          fi
+
+          git commit -m "chore: update EPG $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
