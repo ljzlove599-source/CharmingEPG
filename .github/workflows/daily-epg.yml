@@ -2,11 +2,11 @@ name: Daily EPG Update
 
 on:
   schedule:
-    # 每天00:40 10:15 15:00 18:30更新  UTC 16:40 = 北京时间 00:40
+    # 每天00:40 13:00 更新  UTC 16:40 = 北京时间 00:40
     - cron: 40 16 * * *
-    - cron: 15 02 * * *
-    - cron: 00 07 * * *
-    - cron: 30 10 * * *
+    - cron: 00 05 * * *
+* * *
+
   workflow_dispatch:
 
 permissions:
